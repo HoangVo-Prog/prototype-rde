@@ -140,7 +140,8 @@ class ImageTextDataset(Dataset):
                  dataset,args,
                  transform=None,
                  text_length: int = 77,
-                 truncate: bool = True):
+                 truncate: bool = True,
+                 inject_noise: bool = True):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
@@ -148,7 +149,10 @@ class ImageTextDataset(Dataset):
         self.txt_aug = args.txt_aug
         self.img_aug = args.img_aug
        
-        self.dataset, self.real_correspondences = inject_noisy_correspondence(dataset,args.noisy_rate,args.noisy_file)
+        if inject_noise:
+            self.dataset, self.real_correspondences = inject_noisy_correspondence(dataset,args.noisy_rate,args.noisy_file)
+        else:
+            self.real_correspondences = np.ones(len(dataset), dtype=np.int64)
         self.tokenizer = SimpleTokenizer()
 
     def __len__(self):
