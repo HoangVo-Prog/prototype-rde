@@ -1,7 +1,7 @@
 import argparse
 
 
-def get_args():
+def get_args(argv=None):
     parser = argparse.ArgumentParser(description="IRRA Args")
 
     parser.add_argument("--noisy_rate", default=0.2, type=float)
@@ -14,13 +14,29 @@ def get_args():
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--name", default="baseline", help="experiment name to save")
     parser.add_argument("--output_dir", default="logs")
+    parser.add_argument("--run_time", default="",
+                        help="timestamp used in run output paths; defaults to current time")
     parser.add_argument("--seed", default=1, type=int,
                         help="base random seed for training and prototype initialization")
     parser.add_argument("--log_period", default=100, type=int)
     parser.add_argument("--eval_period", default=1, type=int)
+    parser.add_argument("--eval_after_epoch", default=0, type=int,
+                        help="skip evaluation until this epoch is completed; 0 preserves immediate evaluation")
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
+    parser.add_argument("--wandb", default=False, action='store_true',
+                        help="enable Weights & Biases logging on rank 0")
+    parser.add_argument("--wandb_project", default="RDE",
+                        help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", default="",
+                        help="optional Weights & Biases entity")
+    parser.add_argument("--wandb_name", default="",
+                        help="optional Weights & Biases run name override; defaults to YYYYMMDD_HHMMSS")
+    parser.add_argument("--wandb_mode", default="online", choices=["online", "offline", "disabled"],
+                        help="Weights & Biases mode; --wandb defaults to online")
+    parser.add_argument("--wandb_tags", nargs="*", default=[],
+                        help="optional Weights & Biases run tags")
 
     ######################## model general settings ########################
     parser.add_argument("--pretrain_choice", default='ViT-B/16') # whether use pretrained model
@@ -110,6 +126,6 @@ def get_args():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--test", dest='training', default=True, action='store_false')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     return args

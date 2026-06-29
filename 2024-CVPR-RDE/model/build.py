@@ -159,8 +159,12 @@ class RDE(nn.Module):
         ret.update({'bge_loss':loss1})
         ret.update({'tse_loss':loss2})
 
-        if self.prototype_branch is not None:
+        proto_image_feats = None
+        proto_text_feats = None
+        if getattr(self.args, "track_train_diagnostics", True) or self.prototype_branch is not None:
             proto_image_feats, proto_text_feats = self.select_prototype_features(outputs, batch)
+
+        if getattr(self.args, "track_train_diagnostics", True):
             ret["_diag"] = {
                 "host_image_feats": proto_image_feats.detach(),
                 "host_text_feats": proto_text_feats.detach(),
@@ -169,6 +173,8 @@ class RDE(nn.Module):
                 "pids": batch["pids"].detach(),
                 "indices": batch.get("index", None),
             }
+
+        if self.prototype_branch is not None:
             proto_ret = self.prototype_branch(
                 proto_image_feats,
                 proto_text_feats,

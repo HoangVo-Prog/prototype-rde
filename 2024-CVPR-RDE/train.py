@@ -16,6 +16,7 @@ from model import build_model
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
+from utils.wandb_utils import setup_wandb, wandb_finish
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -28,6 +29,46 @@ def set_seed(seed=0):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
+
+
+def _count_parameters(module, trainable_only=False):
+    return sum(
+        p.numel()
+        for p in module.parameters()
+        if not trainable_only or p.requires_grad
+    )
+
+
+def _count_buffers(module):
+    return sum(buffer.numel() for buffer in module.buffers())
+
+
+def log_model_parameter_counts(model, logger):
+    total_params = _count_parameters(model)
+    logger.info('Total params: %2.fM' % (total_params / 1000000.0))
+
+    prototype_branch = getattr(model, "prototype_branch", None)
+    if prototype_branch is None:
+        logger.info("Prototype branch params: disabled")
+        return
+
+    prototype_params = _count_parameters(prototype_branch)
+    prototype_trainable_params = _count_parameters(prototype_branch, trainable_only=True)
+    prototype_buffer_elements = _count_buffers(prototype_branch)
+    prototype_share = (prototype_params / total_params * 100.0) if total_params else 0.0
+    logger.info(
+        "Prototype branch params: %d total (%.4fM), %d trainable (%.4fM), %.2f%% of total model params",
+        prototype_params,
+        prototype_params / 1000000.0,
+        prototype_trainable_params,
+        prototype_trainable_params / 1000000.0,
+        prototype_share,
+    )
+    logger.info(
+        "Prototype branch buffers: %d elements (%.4fM, not counted as params)",
+        prototype_buffer_elements,
+        prototype_buffer_elements / 1000000.0,
+    )
 
 
 if __name__ == '__main__':
@@ -44,12 +85,13 @@ if __name__ == '__main__':
         synchronize()
     
     device = "cuda"
-    cur_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    cur_time = args.run_time or time.strftime("%Y%m%d_%H%M%S", time.localtime())
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
     logger = setup_logger('RDE', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)
+    wandb_run = setup_wandb(args, cur_time, logger)
     if not os.path.isdir(args.output_dir+'/img'):
         os.makedirs(args.output_dir+'/img')
     # get image-text pair datasets dataloader
@@ -59,7 +101,7 @@ if __name__ == '__main__':
         
     train_loader, val_img_loader, val_txt_loader, num_classes = build_dataloader(args)
     model = build_model(args, num_classes)
-    logger.info('Total params: %2.fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
+    log_model_parameter_counts(model, logger)
     model.to(device)
 
     if args.distributed:
@@ -84,7 +126,11 @@ if __name__ == '__main__':
         logger.info(f"===================>start {start_epoch}")
 
 
-    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+    try:
+        do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+    finally:
+        if wandb_run is not None:
+            wandb_finish()
     
     # test
     logger.info(f"===================>start test")
