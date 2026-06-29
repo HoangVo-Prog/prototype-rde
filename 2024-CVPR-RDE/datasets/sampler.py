@@ -40,7 +40,7 @@ class RandomIdentitySampler(Sampler):
         for pid in self.pids:
             idxs = copy.deepcopy(self.index_dic[pid])
             if len(idxs) < self.num_instances:
-                idxs = np.random.choice(idxs, size=self.num_instances, replace=True)
+                idxs = np.random.choice(idxs, size=self.num_instances, replace=True).tolist()
             random.shuffle(idxs)
             batch_idxs = []
             for idx in idxs:
@@ -64,4 +64,3 @@ class RandomIdentitySampler(Sampler):
 
     def __len__(self):
         return self.length
-

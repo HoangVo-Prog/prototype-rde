@@ -164,7 +164,7 @@ class RandomIdentitySampler_DDP(Sampler):
             index = range(self.mini_batch_size * self.rank + self.mini_batch_size * i, min(self.mini_batch_size * self.rank + self.mini_batch_size * (i+1), total_num))
             index_target.extend(index)
         index_target_npy = np.array(index_target)
-        final_idxs = list(np.array(final_idxs)[index_target_npy])
+        final_idxs = np.array(final_idxs)[index_target_npy].tolist()
         return final_idxs
 
 
@@ -194,4 +194,3 @@ class RandomIdentitySampler_DDP(Sampler):
 
     def __len__(self):
         return self.length
-
