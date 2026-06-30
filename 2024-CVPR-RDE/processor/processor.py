@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
@@ -16,7 +17,7 @@ from pylab import xticks,yticks,np
 from sklearn.metrics import confusion_matrix
 from sklearn.mixture import GaussianMixture
 from datasets.bases import ImageTextDataset
-from datasets.build import build_transforms, collate
+from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
 
 
 ################### CODE FOR THE BETA MODEL  ########################
@@ -136,6 +137,30 @@ def _prototype_ready(model):
     return branch is not None and branch.is_ready()
 
 
+def _set_epoch_on_loader(loader, epoch):
+    sampler = getattr(loader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    inner_sampler = getattr(batch_sampler, "sampler", None)
+    if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+        inner_sampler.set_epoch(epoch)
+
+
+def _broadcast_prototype_memory(model, src=0):
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    branch = getattr(_unwrap_model(model), "prototype_branch", None)
+    memory = getattr(branch, "memory", None) if branch is not None else None
+    if memory is None:
+        return
+
+    for buffer in memory.buffers():
+        dist.broadcast(buffer, src=src)
+
+
 def _build_prototype_init_loader(train_loader, args):
     train_set = getattr(train_loader, "dataset", None)
     source_dataset = getattr(train_set, "dataset", None)
@@ -159,6 +184,38 @@ def _build_prototype_init_loader(train_loader, args):
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate,
+        worker_init_fn=seed_worker,
+        generator=make_data_loader_generator(args, offset=4000),
+    )
+
+
+def _build_label_estimation_loader(train_loader, args, epoch):
+    train_set = getattr(train_loader, "dataset", None)
+    source_dataset = getattr(train_set, "dataset", None)
+    if train_set is None or source_dataset is None:
+        return train_loader
+
+    label_set = ImageTextDataset(
+        source_dataset,
+        args,
+        transform=build_transforms(img_size=args.img_size, aug=False, is_train=False),
+        text_length=getattr(train_set, "text_length", args.text_length),
+        truncate=getattr(train_set, "truncate", True),
+        inject_noise=False,
+    )
+    label_set.txt_aug = False
+    label_set.img_aug = False
+    if hasattr(train_set, "real_correspondences"):
+        label_set.real_correspondences = train_set.real_correspondences
+
+    return DataLoader(
+        label_set,
+        batch_size=getattr(args, "test_batch_size", args.batch_size),
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate,
+        worker_init_fn=seed_worker,
+        generator=make_data_loader_generator(args, offset=8000 + int(epoch)),
     )
 
 
@@ -227,6 +284,7 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     )
     branch.initialize_projected(image_features, text_features, pids)
     logger.info("Prototype banks initialized with %d samples", pids.numel())
+    _broadcast_prototype_memory(model)
     synchronize()
 
 
@@ -367,7 +425,7 @@ def _should_run_epoch_eval(epoch, eval_period, eval_after_epoch):
     return epoch >= eval_after_epoch and epoch % eval_period == 0
 
 
-def get_loss(model, data_loader):
+def get_loss(model, data_loader, epoch=0):
     logger = logging.getLogger("RDE.train")
     model.eval()
     model_without_ddp = _unwrap_model(model)
@@ -395,14 +453,15 @@ def get_loss(model, data_loader):
     input_loss_B = losses_B.reshape(-1,1)
  
     logger.info('\nFitting GMM ...') 
+    gmm_seed = int(getattr(model_without_ddp.args, "seed", 1)) + int(epoch)
  
     if model_without_ddp.args.noisy_rate > 0.4 or model_without_ddp.args.dataset_name=='RSTPReid':
         # should have a better fit 
-        gmm_A = GaussianMixture(n_components=2, max_iter=100, tol=1e-4, reg_covar=1e-6)
-        gmm_B = GaussianMixture(n_components=2, max_iter=100, tol=1e-4, reg_covar=1e-6)
+        gmm_A = GaussianMixture(n_components=2, max_iter=100, tol=1e-4, reg_covar=1e-6, random_state=gmm_seed)
+        gmm_B = GaussianMixture(n_components=2, max_iter=100, tol=1e-4, reg_covar=1e-6, random_state=gmm_seed + 1)
     else:
-        gmm_A = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4)
-        gmm_B = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4)
+        gmm_A = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4, random_state=gmm_seed)
+        gmm_B = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4, random_state=gmm_seed + 1)
 
     gmm_A.fit(input_loss_A.cpu().numpy())
     prob_A = gmm_A.predict_proba(input_loss_A.cpu().numpy())
@@ -468,6 +527,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         for meter in meters.values():
             meter.reset()
 
+        _set_epoch_on_loader(train_loader, epoch)
         # model.train()
         model.epoch = epoch
         # data_size = train_loader.dataset.__len__()
@@ -476,10 +536,22 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             if epoch > getattr(args, "prototype_warmup_epochs", 0) and not _prototype_ready(model):
                 maybe_initialize_prototypes(model, train_loader, args, device, logger)
     
-        pred_A, pred_B = get_loss(model, train_loader)
+        label_loader = _build_label_estimation_loader(train_loader, args, epoch)
+        pred_A, pred_B = get_loss(model, label_loader, epoch=epoch)
     
         consensus_division = pred_A + pred_B # 0,1,2 
-        consensus_division[consensus_division==1] += torch.randint(0, 2, size=(((consensus_division==1)+0).sum(),))
+        tie_mask = consensus_division == 1
+        tie_count = int(tie_mask.sum().item())
+        if tie_count > 0:
+            tie_generator = torch.Generator()
+            tie_generator.manual_seed(int(getattr(args, "seed", 1)) + int(epoch) * 1009 + 6000)
+            consensus_division[tie_mask] += torch.randint(
+                0,
+                2,
+                size=(tie_count,),
+                generator=tie_generator,
+                dtype=consensus_division.dtype,
+            )
         label_hat = consensus_division.clone()
         label_hat[consensus_division>1] = 1
         label_hat[consensus_division<=1] = 0 
@@ -511,6 +583,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            if _prototype_requested(args):
+                _broadcast_prototype_memory(model)
             synchronize()
 
             if (n_iter + 1) % log_period == 0:
@@ -540,7 +614,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             logger.info(
                 "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
                 .format(epoch, time_per_batch,
-                        train_loader.batch_size / time_per_batch))
+                        (train_loader.batch_size or batch_size) / time_per_batch))
         if _should_run_epoch_eval(epoch, eval_period, eval_after_epoch):
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))

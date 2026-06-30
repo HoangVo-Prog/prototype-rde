@@ -21,14 +21,34 @@ from utils.wandb_utils import setup_wandb, wandb_finish
 import warnings
 warnings.filterwarnings("ignore")
 
-def set_seed(seed=0):
+def set_seed(seed=0, deterministic=False):
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(False, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(False)
 
 
 def _count_parameters(module, trainable_only=False):
@@ -73,7 +93,7 @@ def log_model_parameter_counts(model, logger):
 
 if __name__ == '__main__':
     args = get_args()
-    set_seed(args.seed + get_rank())
+    set_seed(args.seed + get_rank(), deterministic=args.deterministic)
     name = args.name
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
@@ -89,6 +109,13 @@ if __name__ == '__main__':
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
     logger = setup_logger('RDE', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
+    logger.info("Seed: %s (rank-adjusted: %s)", args.seed, args.seed + get_rank())
+    logger.info("Deterministic mode: %s", args.deterministic)
+    logger.info("cuDNN benchmark: %s", torch.backends.cudnn.benchmark)
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        logger.info("TF32 matmul enabled: %s", torch.backends.cuda.matmul.allow_tf32)
+    if hasattr(torch.backends, "cudnn"):
+        logger.info("TF32 cuDNN enabled: %s", torch.backends.cudnn.allow_tf32)
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)
     wandb_run = setup_wandb(args, cur_time, logger)

@@ -1,13 +1,15 @@
 import logging
 import numbers
+import random
 import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
 from datasets.sampler import RandomIdentitySampler
 from datasets.sampler_ddp import RandomIdentitySampler_DDP
 from torch.utils.data.distributed import DistributedSampler
+import numpy as np
 
-from utils.comm import get_world_size
+from utils.comm import get_world_size, get_rank
 
 from .bases import ImageDataset, TextDataset, ImageTextDataset
 
@@ -53,6 +55,19 @@ def build_transforms(img_size=(384, 128), aug=False, is_train=True):
     return transform
 
 
+def make_data_loader_generator(args, offset=0):
+    generator = torch.Generator()
+    base_seed = int(getattr(args, "seed", 1)) + get_rank() * 1000
+    generator.manual_seed(base_seed + int(offset))
+    return generator
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def collate(batch):
     keys = set([key for b in batch for key in b.keys()])
     # turn list of dicts data structure to dict of lists data structure
@@ -93,11 +108,19 @@ def build_dataloader(args, tranforms=None):
                 logger.info('using ddp random identity sampler')
                 logger.info('DISTRIBUTED TRAIN START')
                 mini_batch_size = args.batch_size // get_world_size()
-                # TODO wait to fix bugs
                 data_sampler = RandomIdentitySampler_DDP(
-                    dataset.train, args.batch_size, args.num_instance)
+                    dataset.train,
+                    args.batch_size,
+                    args.num_instance,
+                    seed=getattr(args, "seed", 1))
                 batch_sampler = torch.utils.data.sampler.BatchSampler(
                     data_sampler, mini_batch_size, True)
+                train_loader = DataLoader(train_set,
+                                          batch_sampler=batch_sampler,
+                                          num_workers=num_workers,
+                                          collate_fn=collate,
+                                          worker_init_fn=seed_worker,
+                                          generator=make_data_loader_generator(args))
 
             else:
                 logger.info(
@@ -106,18 +129,41 @@ def build_dataloader(args, tranforms=None):
                 train_loader = DataLoader(train_set,
                                           batch_size=args.batch_size,
                                           sampler=RandomIdentitySampler(
-                                              dataset.train, args.batch_size,
-                                              args.num_instance),
+                                              dataset.train,
+                                              args.batch_size,
+                                              args.num_instance,
+                                              seed=getattr(args, "seed", 1) + get_rank() * 1000),
                                           num_workers=num_workers,
-                                          collate_fn=collate)
+                                          collate_fn=collate,
+                                          worker_init_fn=seed_worker,
+                                          generator=make_data_loader_generator(args))
         elif args.sampler == 'random':
-            # TODO add distributed condition
             logger.info('using random sampler')
-            train_loader = DataLoader(train_set,
-                                      batch_size=args.batch_size,
-                                      shuffle=True,
-                                      num_workers=num_workers,
-                                      collate_fn=collate)
+            if args.distributed:
+                mini_batch_size = args.batch_size // get_world_size()
+                data_sampler = DistributedSampler(
+                    train_set,
+                    num_replicas=get_world_size(),
+                    rank=get_rank(),
+                    shuffle=True,
+                    seed=getattr(args, "seed", 1),
+                )
+                train_loader = DataLoader(train_set,
+                                          batch_size=mini_batch_size,
+                                          sampler=data_sampler,
+                                          shuffle=False,
+                                          num_workers=num_workers,
+                                          collate_fn=collate,
+                                          worker_init_fn=seed_worker,
+                                          generator=make_data_loader_generator(args))
+            else:
+                train_loader = DataLoader(train_set,
+                                          batch_size=args.batch_size,
+                                          shuffle=True,
+                                          num_workers=num_workers,
+                                          collate_fn=collate,
+                                          worker_init_fn=seed_worker,
+                                          generator=make_data_loader_generator(args))
         else:
             logger.error('unsupported sampler! expected softmax or triplet but got {}'.format(args.sampler))
 
@@ -132,11 +178,15 @@ def build_dataloader(args, tranforms=None):
         val_img_loader = DataLoader(val_img_set,
                                     batch_size=args.batch_size,
                                     shuffle=False,
-                                    num_workers=num_workers)
+                                    num_workers=num_workers,
+                                    worker_init_fn=seed_worker,
+                                    generator=make_data_loader_generator(args, offset=1000))
         val_txt_loader = DataLoader(val_txt_set,
                                     batch_size=args.batch_size,
                                     shuffle=False,
-                                    num_workers=num_workers)
+                                    num_workers=num_workers,
+                                    worker_init_fn=seed_worker,
+                                    generator=make_data_loader_generator(args, offset=2000))
 
         return train_loader, val_img_loader, val_txt_loader, num_classes
 
@@ -158,9 +208,13 @@ def build_dataloader(args, tranforms=None):
         test_img_loader = DataLoader(test_img_set,
                                      batch_size=args.test_batch_size,
                                      shuffle=False,
-                                     num_workers=num_workers)
+                                     num_workers=num_workers,
+                                     worker_init_fn=seed_worker,
+                                     generator=make_data_loader_generator(args, offset=3000))
         test_txt_loader = DataLoader(test_txt_set,
                                      batch_size=args.test_batch_size,
                                      shuffle=False,
-                                     num_workers=num_workers)
+                                     num_workers=num_workers,
+                                     worker_init_fn=seed_worker,
+                                     generator=make_data_loader_generator(args, offset=4000))
         return test_img_loader, test_txt_loader, num_classes
