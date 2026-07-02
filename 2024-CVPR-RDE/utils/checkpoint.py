@@ -6,6 +6,14 @@ from collections import OrderedDict
 import torch
 
 
+def _strip_module_prefix_key(key):
+    return key[len("module."):] if key.startswith("module.") else key
+
+
+def _is_model_prototype_key(key):
+    return _strip_module_prefix_key(key).startswith("prototype_branch.")
+
+
 class Checkpointer:
     def __init__(
         self,
@@ -63,10 +71,24 @@ class Checkpointer:
         self._load_model(checkpoint)
         if "optimizer" in checkpoint and self.optimizer:
             self.logger.info("Loading optimizer from {}".format(f))
-            self.optimizer.load_state_dict(checkpoint.pop("optimizer"))
+            try:
+                self.optimizer.load_state_dict(checkpoint.pop("optimizer"))
+            except Exception as exc:
+                self.logger.warning(
+                    "Skipping optimizer state from %s because it is incompatible with the current model: %s",
+                    f,
+                    exc,
+                )
         if "scheduler" in checkpoint and self.scheduler:
             self.logger.info("Loading scheduler from {}".format(f))
-            self.scheduler.load_state_dict(checkpoint.pop("scheduler"))
+            try:
+                self.scheduler.load_state_dict(checkpoint.pop("scheduler"))
+            except Exception as exc:
+                self.logger.warning(
+                    "Skipping scheduler state from %s because it is incompatible with the current optimizer: %s",
+                    f,
+                    exc,
+                )
         # return any further checkpoint data
         return checkpoint
 
@@ -90,6 +112,11 @@ def check_key(key, except_keys):
 def align_and_update_state_dicts(model_state_dict, loaded_state_dict, except_keys=None):
     current_keys = sorted(list(model_state_dict.keys()))
     loaded_keys = sorted(list(loaded_state_dict.keys()))
+    logger = logging.getLogger("PersonSearch.checkpoint")
+    if not loaded_keys:
+        logger.warning("Checkpoint model state is empty; keeping current model initialization.")
+        return
+
     # get a matrix of string matches, where each (i, j) entry correspond to the size of the
     # loaded_key string, if it matches
     match_matrix = [
@@ -106,15 +133,28 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, except_key
     max_size = max([len(key) for key in current_keys]) if current_keys else 1
     max_size_loaded = max([len(key) for key in loaded_keys]) if loaded_keys else 1
     log_str_template = "{: <{}} loaded from {: <{}} of shape {}"
-    logger = logging.getLogger("PersonSearch.checkpoint")
+    matched_loaded_keys = set()
+    missing_keys = []
+    shape_mismatches = []
     for idx_new, idx_old in enumerate(idxs.tolist()):
         if idx_old == -1:
+            missing_keys.append(current_keys[idx_new])
             continue
+
         key = current_keys[idx_new]
         key_old = loaded_keys[idx_old]
         if check_key(key, except_keys):
             continue
+        if tuple(model_state_dict[key].shape) != tuple(loaded_state_dict[key_old].shape):
+            shape_mismatches.append((
+                key,
+                key_old,
+                tuple(model_state_dict[key].shape),
+                tuple(loaded_state_dict[key_old].shape),
+            ))
+            continue
         model_state_dict[key] = loaded_state_dict[key_old]
+        matched_loaded_keys.add(key_old)
         logger.info(
             log_str_template.format(
                 key,
@@ -123,6 +163,32 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, except_key
                 max_size_loaded,
                 tuple(loaded_state_dict[key_old].shape),
             )
+        )
+
+    unexpected_keys = [key for key in loaded_keys if key not in matched_loaded_keys]
+    missing_proto = [key for key in missing_keys if _is_model_prototype_key(key)]
+    unexpected_proto = [key for key in unexpected_keys if _is_model_prototype_key(key)]
+    if missing_proto:
+        logger.warning(
+            "Checkpoint is missing %d prototype tensor(s) for the current model; keeping initialized values. Examples: %s",
+            len(missing_proto),
+            ", ".join(missing_proto[:5]),
+        )
+    if unexpected_proto:
+        logger.warning(
+            "Checkpoint contains %d unmatched prototype tensor(s) that are ignored by the current model. Examples: %s",
+            len(unexpected_proto),
+            ", ".join(unexpected_proto[:5]),
+        )
+    if shape_mismatches:
+        examples = [
+            f"{key} <= {key_old} current={current_shape} checkpoint={loaded_shape}"
+            for key, key_old, current_shape, loaded_shape in shape_mismatches[:5]
+        ]
+        logger.warning(
+            "Skipped %d checkpoint tensor(s) with incompatible shapes. Examples: %s",
+            len(shape_mismatches),
+            "; ".join(examples),
         )
 
 

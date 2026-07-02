@@ -17,6 +17,7 @@ from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
 from utils.wandb_utils import setup_wandb, wandb_finish
+from utils.ablation import ablation_suffix, finalize_ablation_args, log_ablation_config
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -93,6 +94,7 @@ def log_model_parameter_counts(model, logger):
 
 if __name__ == '__main__':
     args = get_args()
+    finalize_ablation_args(args)
     set_seed(args.seed + get_rank(), deterministic=args.deterministic)
     name = args.name
 
@@ -106,7 +108,11 @@ if __name__ == '__main__':
     
     device = "cuda"
     cur_time = args.run_time or time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
+    args.output_dir = op.join(
+        args.output_dir,
+        args.dataset_name,
+        f'{cur_time}_{name}_{args.loss_names}{ablation_suffix(args)}',
+    )
     logger = setup_logger('RDE', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info("Seed: %s (rank-adjusted: %s)", args.seed, args.seed + get_rank())
@@ -116,6 +122,7 @@ if __name__ == '__main__':
         logger.info("TF32 matmul enabled: %s", torch.backends.cuda.matmul.allow_tf32)
     if hasattr(torch.backends, "cudnn"):
         logger.info("TF32 cuDNN enabled: %s", torch.backends.cudnn.allow_tf32)
+    log_ablation_config(args, logger)
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)
     wandb_run = setup_wandb(args, cur_time, logger)

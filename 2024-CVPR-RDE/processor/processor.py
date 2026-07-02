@@ -9,6 +9,7 @@ from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
 from utils.train_diagnostics import compute_train_diagnostics
 from utils.wandb_utils import wandb_log, wandb_upload_best_checkpoints
+from utils.ablation import pbt_enabled
 from torch.utils.tensorboard import SummaryWriter
 from prettytable import PrettyTable
 import numpy as np
@@ -126,10 +127,7 @@ def _unwrap_model(model):
 
 
 def _prototype_requested(args):
-    return (
-        getattr(args, "prototype", False)
-        or getattr(args, "use_loss_id", False)
-    )
+    return pbt_enabled(args)
 
 
 def _prototype_ready(model):

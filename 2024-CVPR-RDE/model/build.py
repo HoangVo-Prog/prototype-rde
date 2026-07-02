@@ -3,6 +3,7 @@ from model import objectives
 from .CrossEmbeddingLayer_tse import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .clip_model import build_CLIP_from_openai_pretrained, convert_weights
 from .prototype import PrototypeBranch
+from utils.ablation import ira_enabled, pbt_enabled
 import torch
 import torch.nn as nn 
 import torch.nn.functional as F
@@ -28,10 +29,7 @@ class RDE(nn.Module):
  
         self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
         self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
-        self.prototype_enabled = (
-            getattr(args, "prototype", False)
-            or getattr(args, "use_loss_id", False)
-        )
+        self.prototype_enabled = pbt_enabled(args)
         self.prototype_feature_source = self._resolve_prototype_feature_source()
         if self.prototype_enabled:
             image_dim, text_dim = self._prototype_feature_dims()
@@ -161,25 +159,30 @@ class RDE(nn.Module):
 
         proto_image_feats = None
         proto_text_feats = None
-        if getattr(self.args, "track_train_diagnostics", True) or self.prototype_branch is not None:
+        if self.prototype_branch is not None:
             proto_image_feats, proto_text_feats = self.select_prototype_features(outputs, batch)
 
         if getattr(self.args, "track_train_diagnostics", True):
-            ret["_diag"] = {
-                "host_image_feats": proto_image_feats.detach(),
-                "host_text_feats": proto_text_feats.detach(),
-                "proto_image_feats": proto_image_feats.detach(),
-                "proto_text_feats": proto_text_feats.detach(),
+            host_image_feats, host_text_feats = self.select_prototype_features(outputs, batch)
+            diag = {
+                "host_image_feats": host_image_feats.detach(),
+                "host_text_feats": host_text_feats.detach(),
                 "pids": batch["pids"].detach(),
                 "indices": batch.get("index", None),
             }
+            if self.prototype_branch is not None:
+                diag.update({
+                    "proto_image_feats": proto_image_feats.detach(),
+                    "proto_text_feats": proto_text_feats.detach(),
+                })
+            ret["_diag"] = diag
 
         if self.prototype_branch is not None:
             proto_ret = self.prototype_branch(
                 proto_image_feats,
                 proto_text_feats,
                 batch['pids'],
-                use_loss_id=getattr(self.args, "use_loss_id", False),
+                use_loss_id=ira_enabled(self.args),
             )
             if "proto_id_loss" in proto_ret:
                 ret["proto_id_loss"] = proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 0.2)

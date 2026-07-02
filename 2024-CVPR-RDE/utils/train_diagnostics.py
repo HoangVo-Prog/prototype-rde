@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from utils.ablation import pbt_enabled
 
 
 def _unwrap_model(model):
@@ -339,7 +340,7 @@ def compute_train_diagnostics(model, ret, args, state):
     hard_k = getattr(args, "prototype_hard_k", 16)
     image_prototypes, text_prototypes = _identity_proxy_banks(
         memory,
-        use_pbt=not getattr(args, "no_pbt", False),
+        use_pbt=pbt_enabled(args),
     )
 
     img_margin, img_hard_pids = _prototype_margin(

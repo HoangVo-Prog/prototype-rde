@@ -17,6 +17,8 @@ The target behavior is:
 - initialize prototype memory once from the full train set after warmup;
 - add a weighted prototype identity loss during training;
 - update prototype memory with no-gradient EMA;
+- allow the prototype/PBT branch and identity-aware regularizer to be ablated
+  independently;
 - log prototype losses and diagnostics through the host's existing logging
   system.
 
@@ -32,8 +34,9 @@ Implement the fixed-slot identity-aware prototype branch:
 - identity-restricted assignment for initialization and EMA;
 - symmetric prototype identity loss with hard wrong-identity prototype
   negatives;
-- optional `--no_pbt` ablation that uses raw cross-modal prototype banks instead
-  of translated PBT banks.
+- optional `--no_pbt` ablation that disables the prototype/PBT branch entirely;
+- optional `--no_ira` ablation that keeps the prototype/PBT path active but
+  disables the identity-aware prototype loss.
 
 Do not implement these as part of the first plug-and-play port unless the user
 explicitly asks:
@@ -137,7 +140,8 @@ a new codebase.
 | --- | --- |
 | `--prototype` | Build prototype infrastructure even if the loss is not enabled yet. |
 | `--use_loss_id` | Add `proto_id_loss` to the host training objective. Also implies building the branch. |
-| `--no_pbt` | Use raw cross-modal prototype banks for identity loss instead of translated PBT banks. |
+| `--no_pbt` | Disable the prototype/PBT branch, including prototype losses, initialization, and memory updates. |
+| `--no_ira` | Disable only the identity-aware prototype loss; keep the prototype/PBT path active when requested. |
 | `--prototype_feature` | Select the host feature source routed into the branch. |
 | `--prototype_projector` | Projection mode: `default`, `identity`, `residual_identity`, `random_orthogonal`, `pca_init`, `shared`, `shared_pca_init`. |
 | `--prototype_residual_scale` | Residual scale for `residual_identity`. |
@@ -480,12 +484,10 @@ image features compare with text_to_image
 text features compare with image_to_text
 ```
 
-With `--no_pbt`:
-
-```text
-image features compare with text_prototypes
-text features compare with image_prototypes
-```
+With `--no_ira`, this loss is not computed or returned, but the prototype
+memory can still initialize and update when the PBT branch is active. With
+`--no_pbt`, this whole prototype loss path is inactive because the branch is
+not constructed.
 
 For one direction:
 

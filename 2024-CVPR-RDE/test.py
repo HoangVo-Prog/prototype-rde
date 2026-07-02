@@ -14,6 +14,7 @@ from model import build_model
 from utils.metrics import Evaluator
 import argparse
 from utils.iotools import load_train_configs
+from utils.ablation import finalize_ablation_args, log_ablation_config
 
 
 if __name__ == '__main__':
@@ -22,8 +23,10 @@ if __name__ == '__main__':
     parser.add_argument("--config_file", default=f'{sub}/configs.yaml')
     args = parser.parse_args()
     args = load_train_configs(args.config_file)
+    finalize_ablation_args(args)
     args.training = False
     logger = setup_logger('RDE', save_dir=args.output_dir, if_train=args.training)
+    log_ablation_config(args, logger)
     logger.info(args)
     device = "cuda"
     args.output_dir =sub
@@ -36,5 +39,4 @@ if __name__ == '__main__':
             checkpointer.load(f=op.join(args.output_dir, asss[i]))
             model = model.cuda()
             do_inference(model, test_img_loader, test_txt_loader)
-
 

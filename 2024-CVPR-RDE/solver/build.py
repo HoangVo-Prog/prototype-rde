@@ -1,6 +1,7 @@
 import torch
 
 from .lr_scheduler import LRSchedulerWithWarmup
+from utils.ablation import pbt_enabled
 
 
 def build_optimizer(args, model):
@@ -10,7 +11,10 @@ def build_optimizer(args, model):
         prototype_lr = args.lr * args.lr_factor
 
     print(f'Using {args.lr_factor} times learning rate for random init module ')
-    print(f'Using {prototype_lr} learning rate for prototype branch ')
+    if pbt_enabled(args):
+        print(f'Using {prototype_lr} learning rate for prototype branch ')
+    else:
+        print('Prototype branch disabled; no prototype learning rate group ')
     
     for key, value in model.named_parameters():
         if not value.requires_grad:

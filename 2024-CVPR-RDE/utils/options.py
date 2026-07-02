@@ -1,5 +1,7 @@
 import argparse
 
+from .ablation import finalize_ablation_args
+
 
 def get_args(argv=None):
     parser = argparse.ArgumentParser(description="IRRA Args")
@@ -60,8 +62,10 @@ def get_args(argv=None):
                         help="build the prototype branch without necessarily adding its loss")
     parser.add_argument("--use_loss_id", default=False, action='store_true',
                         help="add the weighted prototype identity loss to training")
-    parser.add_argument("--no_pbt", default=False, action='store_true',
-                        help="use raw cross-modal prototype banks instead of translated PBT banks")
+    parser.add_argument("--no_pbt", "--no-pbt", dest="no_pbt", default=False, action='store_true',
+                        help="disable the prototype/PBT branch, including prototype losses and memory updates")
+    parser.add_argument("--no_ira", "--no-ira", dest="no_ira", default=False, action='store_true',
+                        help="disable the identity-aware regularization/prototype identity loss only")
     parser.add_argument("--prototype_feature", type=str, default="auto",
                         choices=["auto", "global", "tse", "local"],
                         help="RDE feature source used by the prototype branch; auto maps to global")
@@ -129,5 +133,6 @@ def get_args(argv=None):
     parser.add_argument("--test", dest='training', default=True, action='store_false')
 
     args = parser.parse_args(argv)
+    finalize_ablation_args(args)
 
     return args
