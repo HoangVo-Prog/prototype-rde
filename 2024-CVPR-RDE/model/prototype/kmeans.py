@@ -54,6 +54,14 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096, generato
 
 
 @torch.no_grad()
+def global_kmeans(features, num_clusters, num_iters=20, seed=None):
+    """Build a shared prototype bank without identity-owned slots."""
+    features = F.normalize(features.float(), p=2, dim=1)
+    generator = _make_generator(features.device, seed)
+    return torch_kmeans(features, num_clusters, num_iters=num_iters, generator=generator)
+
+
+@torch.no_grad()
 def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20, seed=None):
     """Build fixed-count, identity-owned prototype slots."""
     features = F.normalize(features.float(), p=2, dim=1)

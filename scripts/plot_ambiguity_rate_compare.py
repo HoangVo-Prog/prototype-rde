@@ -311,6 +311,8 @@ def default_model_args() -> Dict[str, Any]:
         "use_loss_id": False,
         "no_pbt": False,
         "no_ira": False,
+        "no_ira_mode": "hard",
+        "no_iopm": False,
         "prototype_feature": "auto",
         "prototype_projector": "default",
         "prototype_residual_scale": 0.1,

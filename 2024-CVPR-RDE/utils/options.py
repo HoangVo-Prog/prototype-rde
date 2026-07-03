@@ -63,9 +63,14 @@ def get_args(argv=None):
     parser.add_argument("--use_loss_id", default=False, action='store_true',
                         help="add the weighted prototype identity loss to training")
     parser.add_argument("--no_pbt", "--no-pbt", dest="no_pbt", default=False, action='store_true',
-                        help="disable the prototype/PBT branch, including prototype losses and memory updates")
+                        help="disable use of translated PBT banks and use raw cross-modal prototypes for identity loss")
     parser.add_argument("--no_ira", "--no-ira", dest="no_ira", default=False, action='store_true',
-                        help="disable the identity-aware regularization/prototype identity loss only")
+                        help="disable identity-restricted prototype assignment and allow global prototype assignment")
+    parser.add_argument("--no_ira_mode", "--no-ira-mode", dest="no_ira_mode", type=str, default="hard",
+                        choices=["hard", "soft"],
+                        help="assignment mode used with --no_ira: hard uses global argmax, soft uses full-bank soft assignment")
+    parser.add_argument("--no_iopm", "--no-iopm", dest="no_iopm", default=False, action='store_true',
+                        help="disable identity-owned prototype memory initialization and use global k-means over all prototypes")
     parser.add_argument("--prototype_feature", type=str, default="auto",
                         choices=["auto", "global", "tse", "local"],
                         help="RDE feature source used by the prototype branch; auto maps to global")

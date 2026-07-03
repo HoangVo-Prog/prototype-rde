@@ -92,8 +92,14 @@ class PrototypeBranch(nn.Module):
         self.text_dim = int(text_dim if text_dim is not None else image_dim)
         self.prototype_dim = int(getattr(args, "prototype_dim", 512))
         self.projector_mode = getattr(args, "prototype_projector", "default")
-        self.pbt_enabled = not bool(getattr(args, "no_pbt", False))
         self.no_ira = bool(getattr(args, "no_ira", False))
+        self.no_ira_mode = getattr(args, "no_ira_mode", "hard")
+        if self.no_ira_mode not in ("hard", "soft"):
+            raise ValueError(f"Unknown --no_ira_mode: {self.no_ira_mode}")
+        self.assignment_mode = "identity_hard"
+        if self.no_ira:
+            self.assignment_mode = "global_soft" if self.no_ira_mode == "soft" else "global_hard"
+        self.no_iopm = bool(getattr(args, "no_iopm", False))
         self._pca_initialized = False
 
         self.image_projector, self.text_projector = self._build_projectors()
@@ -102,6 +108,9 @@ class PrototypeBranch(nn.Module):
             prototypes_per_id=getattr(args, "prototype_per_id", 2),
             dim=self.prototype_dim,
             momentum=getattr(args, "prototype_momentum", 0.2),
+            assignment_mode=self.assignment_mode,
+            assignment_tau=getattr(args, "prototype_tau", 0.05),
+            identity_owned_init=not self.no_iopm,
         )
 
     def _require_equal_input_dims(self):
@@ -206,8 +215,6 @@ class PrototypeBranch(nn.Module):
 
     @torch.no_grad()
     def initialize_projected(self, image_features, text_features, pids):
-        if not self.pbt_enabled:
-            return
         prototype_seed = getattr(self.args, "seed", None)
         if prototype_seed is not None:
             prototype_seed = int(prototype_seed) + 1000
@@ -221,18 +228,12 @@ class PrototypeBranch(nn.Module):
 
     @torch.no_grad()
     def initialize(self, image_features, text_features, pids):
-        if not self.pbt_enabled:
-            return
         if self.needs_pca_init():
             self.initialize_projector_from_features(image_features, text_features)
         image_features, text_features = self._project(image_features, text_features)
         self.initialize_projected(image_features, text_features, pids)
 
     def forward(self, image_features, text_features, pids, use_loss_id=True):
-        if not self.pbt_enabled:
-            return {}
-
-        use_loss_id = bool(use_loss_id and not self.no_ira)
         image_features, text_features = self._project(image_features, text_features)
         zero = image_features.sum() * 0.0
         if not self.is_ready():
@@ -247,7 +248,7 @@ class PrototypeBranch(nn.Module):
                 self.memory,
                 tau=getattr(self.args, "prototype_tau", 0.05),
                 hard_k=getattr(self.args, "prototype_hard_k", 16),
-                use_pbt=True,
+                use_pbt=not getattr(self.args, "no_pbt", False),
             )
 
         self.memory.ema_update(image_features.detach(), text_features.detach(), pids.detach().long())
@@ -255,9 +256,6 @@ class PrototypeBranch(nn.Module):
 
     @torch.no_grad()
     def score(self, text_features, image_features):
-        if not self.pbt_enabled:
-            return text_features.new_zeros((text_features.shape[0], image_features.shape[0]))
-
         was_training = self.training
         self.eval()
         try:

@@ -3,7 +3,7 @@ from model import objectives
 from .CrossEmbeddingLayer_tse import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .clip_model import build_CLIP_from_openai_pretrained, convert_weights
 from .prototype import PrototypeBranch
-from utils.ablation import ira_enabled, pbt_enabled
+from utils.ablation import proto_id_loss_enabled, prototype_requested
 import torch
 import torch.nn as nn 
 import torch.nn.functional as F
@@ -29,7 +29,7 @@ class RDE(nn.Module):
  
         self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
         self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
-        self.prototype_enabled = pbt_enabled(args)
+        self.prototype_enabled = prototype_requested(args)
         self.prototype_feature_source = self._resolve_prototype_feature_source()
         if self.prototype_enabled:
             image_dim, text_dim = self._prototype_feature_dims()
@@ -182,7 +182,7 @@ class RDE(nn.Module):
                 proto_image_feats,
                 proto_text_feats,
                 batch['pids'],
-                use_loss_id=ira_enabled(self.args),
+                use_loss_id=proto_id_loss_enabled(self.args),
             )
             if "proto_id_loss" in proto_ret:
                 ret["proto_id_loss"] = proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 0.2)
