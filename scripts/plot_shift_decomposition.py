@@ -53,6 +53,13 @@ POINT_COLUMNS = [
     "delta_s_pos",
     "delta_s_neg",
     "delta_m",
+    "scale_host",
+    "scale_iapr",
+    "margin_scale",
+    "m_host_norm",
+    "delta_s_pos_norm",
+    "delta_s_neg_norm",
+    "delta_m_norm",
     "selected_by_threshold",
     "margin_improved",
     "positive_attraction",
@@ -66,6 +73,10 @@ BOOL_COLUMNS = {
     "positive_attraction",
     "hard_negative_suppression",
     "attract_and_suppress",
+}
+
+STRING_COLUMNS = {
+    "margin_scale",
 }
 
 INT_COLUMNS = {
@@ -113,6 +124,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iapr_ckpt", "--ours_checkpoint", dest="iapr_ckpt", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--threshold", type=float, default=0.0)
+    parser.add_argument("--margin_scale", default="iqr", choices=["none", "iqr", "std"])
+    parser.add_argument("--scale_eta", type=float, default=1e-12)
+    parser.add_argument("--scale_sample_size", type=int, default=2_000_000)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")
@@ -169,6 +183,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max_points must be non-negative.")
     if not math.isfinite(args.threshold):
         raise ValueError("--threshold must be finite.")
+    if not math.isfinite(args.scale_eta) or args.scale_eta < 0.0:
+        raise ValueError("--scale_eta must be a finite non-negative value.")
+    if args.scale_sample_size < 0:
+        raise ValueError("--scale_sample_size must be non-negative.")
 
 
 def build_model_args(flow: ModuleType, args: argparse.Namespace, model_type: Optional[str]) -> SimpleNamespace:
@@ -236,6 +254,39 @@ def score_pairs(bundle: FeatureBundle, query_indices: Sequence[int], gallery_ind
         grab_scores = (bundle.text_grab_features[q].float() * bundle.image_grab_features[g].float()).sum(dim=1)
         scores = weight * scores + (1.0 - weight) * grab_scores
     return scores.cpu().numpy().astype(np.float64)
+
+
+def compute_bundle_scale_metadata(
+    flow: ModuleType,
+    bundle: FeatureBundle,
+    margin_scale: str,
+    scale_eta: float,
+    scale_sample_size: int,
+    seed: int,
+    chunk_size: int = 512,
+) -> Dict[str, Any]:
+    if margin_scale == "none":
+        return {
+            "margin_scale": margin_scale,
+            "scale_value": 1.0,
+            "scale_eta": float(scale_eta),
+            "scale_score_count_total": int(bundle.query_pids.numel() * bundle.gallery_pids.numel()),
+            "scale_score_count_used": 0,
+            "scale_sampling_seed": int(seed),
+            "scale_is_exact": True,
+        }
+    if not all(hasattr(flow, name) for name in ("init_scale_sampling", "collect_scale_scores", "finalize_scale_metadata")):
+        raise RuntimeError("The local ambiguity script does not expose score-scale helpers.")
+
+    num_queries = int(bundle.query_pids.numel())
+    num_gallery = int(bundle.gallery_pids.numel())
+    state = flow.init_scale_sampling(margin_scale, num_queries, num_gallery, scale_sample_size, seed)
+    chunk_size = max(1, int(chunk_size))
+    for start in tqdm(range(0, num_queries, chunk_size), desc="Estimating score scale"):
+        end = min(start + chunk_size, num_queries)
+        sim = similarity_chunk(bundle, start, end)
+        flow.collect_scale_scores(state, sim, start, num_gallery)
+    return flow.finalize_scale_metadata(state, margin_scale, scale_eta, seed)
 
 
 def retrieval_metrics_from_bundle(
@@ -503,12 +554,19 @@ def compute_shift_rows(
     host: FeatureBundle,
     iapr: FeatureBundle,
     threshold: float,
+    margin_scale: str,
+    host_scale: float,
+    iapr_scale: float,
+    scale_eta: float,
     chunk_size: int = 512,
 ) -> Tuple[List[Dict[str, Any]], int]:
     ensure_same_tensor(host.query_pids, iapr.query_pids, "Query identity")
     ensure_same_tensor(host.gallery_pids, iapr.gallery_pids, "Gallery identity")
     gallery_pids = host.gallery_pids.cpu().long()
     query_pids = host.query_pids.cpu().long()
+    host_denom = 1.0 if margin_scale == "none" else float(host_scale) + float(scale_eta)
+    if host_denom == 0.0:
+        raise ValueError("Host score-scale denominator is zero; increase --scale_eta.")
 
     base_rows: List[Dict[str, Any]] = []
     skipped = 0
@@ -561,7 +619,11 @@ def compute_shift_rows(
         delta_s_pos = float(pos_score_iapr) - s_pos_host
         delta_s_neg = float(neg_score_iapr) - s_neg_host
         delta_m = delta_s_pos - delta_s_neg
-        selected = bool(m_host < threshold)
+        m_host_norm = m_host / host_denom
+        delta_s_pos_norm = delta_s_pos / host_denom
+        delta_s_neg_norm = delta_s_neg / host_denom
+        delta_m_norm = delta_m / host_denom
+        selected = bool(m_host < threshold) if margin_scale == "none" else bool(m_host_norm < threshold)
         row.update(
             {
                 "s_pos_iapr": float(pos_score_iapr),
@@ -570,6 +632,13 @@ def compute_shift_rows(
                 "delta_s_pos": float(delta_s_pos),
                 "delta_s_neg": float(delta_s_neg),
                 "delta_m": float(delta_m),
+                "scale_host": float(host_scale),
+                "scale_iapr": float(iapr_scale),
+                "margin_scale": str(margin_scale),
+                "m_host_norm": float(m_host_norm),
+                "delta_s_pos_norm": float(delta_s_pos_norm),
+                "delta_s_neg_norm": float(delta_s_neg_norm),
+                "delta_m_norm": float(delta_m_norm),
                 "selected_by_threshold": selected,
                 "margin_improved": bool(delta_m > 0.0),
                 "positive_attraction": bool(delta_s_pos > 0.0),
@@ -593,12 +662,21 @@ def stats_for_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Optional[floa
         "median_delta_s_pos",
         "median_delta_s_neg",
         "median_delta_m",
+        "mean_delta_s_pos_norm",
+        "mean_delta_s_neg_norm",
+        "mean_delta_m_norm",
+        "median_delta_s_pos_norm",
+        "median_delta_s_neg_norm",
+        "median_delta_m_norm",
     ]
     if not rows:
         return {key: None for key in keys}
     delta_s_pos = np.array([float(row["delta_s_pos"]) for row in rows], dtype=np.float64)
     delta_s_neg = np.array([float(row["delta_s_neg"]) for row in rows], dtype=np.float64)
     delta_m = np.array([float(row["delta_m"]) for row in rows], dtype=np.float64)
+    delta_s_pos_norm = np.array([float(row["delta_s_pos_norm"]) for row in rows], dtype=np.float64)
+    delta_s_neg_norm = np.array([float(row["delta_s_neg_norm"]) for row in rows], dtype=np.float64)
+    delta_m_norm = np.array([float(row["delta_m_norm"]) for row in rows], dtype=np.float64)
     return {
         "pct_delta_m_positive": float(np.mean(delta_m > 0.0) * 100.0),
         "pct_delta_s_pos_positive": float(np.mean(delta_s_pos > 0.0) * 100.0),
@@ -610,6 +688,12 @@ def stats_for_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Optional[floa
         "median_delta_s_pos": float(np.median(delta_s_pos)),
         "median_delta_s_neg": float(np.median(delta_s_neg)),
         "median_delta_m": float(np.median(delta_m)),
+        "mean_delta_s_pos_norm": float(np.mean(delta_s_pos_norm)),
+        "mean_delta_s_neg_norm": float(np.mean(delta_s_neg_norm)),
+        "mean_delta_m_norm": float(np.mean(delta_m_norm)),
+        "median_delta_s_pos_norm": float(np.median(delta_s_pos_norm)),
+        "median_delta_s_neg_norm": float(np.median(delta_s_neg_norm)),
+        "median_delta_m_norm": float(np.median(delta_m_norm)),
     }
 
 
@@ -645,8 +729,11 @@ def plot_shift_decomposition(
         raise RuntimeError("matplotlib is required to plot shift decomposition.") from exc
 
     plot_rows = selected_plot_rows(rows, args.max_points, args.seed)
-    x = np.array([float(row["delta_s_neg"]) for row in plot_rows], dtype=np.float64)
-    y = np.array([float(row["delta_s_pos"]) for row in plot_rows], dtype=np.float64)
+    normalized = args.margin_scale != "none"
+    x_key = "delta_s_neg_norm" if normalized else "delta_s_neg"
+    y_key = "delta_s_pos_norm" if normalized else "delta_s_pos"
+    x = np.array([float(row[x_key]) for row in plot_rows], dtype=np.float64)
+    y = np.array([float(row[y_key]) for row in plot_rows], dtype=np.float64)
     improved = np.array([bool(row["margin_improved"]) for row in plot_rows], dtype=bool)
 
     selected_count = int(sum(bool(row["selected_by_threshold"]) for row in rows))
@@ -689,22 +776,30 @@ def plot_shift_decomposition(
     ax.set_xlim(limits)
     ax.set_ylim(limits)
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel(r"$\Delta s^-$")
-    ax.set_ylabel(r"$\Delta s^+$")
+    if normalized:
+        ax.set_xlabel(r"$\Delta s^- / c_{\mathrm{Host}}$")
+        ax.set_ylabel(r"$\Delta s^+ / c_{\mathrm{Host}}$")
+    else:
+        ax.set_xlabel(r"$\Delta s^-$")
+        ax.set_ylabel(r"$\Delta s^+$")
     title = args.plot_title.strip() or f"{dataset_name} {split} shift decomposition"
     ax.set_title(title)
     ax.grid(True, alpha=0.22, linewidth=0.6)
     ax.legend(frameon=False, fontsize=8, loc="best")
 
+    threshold_line = (r"$\rho$ = " if normalized else "threshold = ") + f"{args.threshold:g}"
+    scale_label = {"iqr": "IQR_Host", "std": "STD_Host"}.get(args.margin_scale, "raw")
     box_lines = [
         f"N = {selected_count}",
+        threshold_line,
+        f"scale = {scale_label}" if normalized else "scale = raw",
         r"% $\Delta m > 0$ = " + format_stat(selected_stats["pct_delta_m_positive"], "%"),
         r"% $\Delta s^+ > 0$ = " + format_stat(selected_stats["pct_delta_s_pos_positive"], "%"),
         r"% $\Delta s^- < 0$ = " + format_stat(selected_stats["pct_delta_s_neg_negative"], "%"),
         "% both = " + format_stat(selected_stats["pct_attract_and_suppress"], "%"),
-        r"median $\Delta s^+$ = " + format_stat(selected_stats["median_delta_s_pos"]),
-        r"median $\Delta s^-$ = " + format_stat(selected_stats["median_delta_s_neg"]),
-        r"median $\Delta m$ = " + format_stat(selected_stats["median_delta_m"]),
+        (r"median $\Delta m/c_H$ = " + format_stat(selected_stats["median_delta_m_norm"]))
+        if normalized
+        else (r"median $\Delta m$ = " + format_stat(selected_stats["median_delta_m"])),
     ]
     ax.text(
         0.03,
@@ -741,6 +836,8 @@ def save_npz(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
         values = [row[column] for row in rows]
         if column in BOOL_COLUMNS:
             arrays[column] = np.asarray(values, dtype=bool)
+        elif column in STRING_COLUMNS:
+            arrays[column] = np.asarray(values, dtype=str)
         elif column in INT_COLUMNS:
             arrays[column] = np.asarray(values, dtype=np.int64)
         else:
@@ -776,7 +873,7 @@ def print_shift_summary(rows: Sequence[Mapping[str, Any]], selected_rows: Sequen
         f"threshold={stats['threshold']} rule={stats['selection_rule']}"
     )
     if not selected_rows:
-        print("[Shift] Warning: no query satisfies m_host < threshold; saved empty selected plot and JSON stats.")
+        print(f"[Shift] Warning: no query satisfies {stats['selection_rule']}; saved empty selected plot and JSON stats.")
         return
     selected = stats["selected"]
     print(
@@ -785,7 +882,8 @@ def print_shift_summary(rows: Sequence[Mapping[str, Any]], selected_rows: Sequen
         f"pct_delta_s_pos_positive={format_stat(selected['pct_delta_s_pos_positive'], '%')}, "
         f"pct_delta_s_neg_negative={format_stat(selected['pct_delta_s_neg_negative'], '%')}, "
         f"pct_attract_and_suppress={format_stat(selected['pct_attract_and_suppress'], '%')}, "
-        f"median_delta_m={format_stat(selected['median_delta_m'])}"
+        f"median_delta_m={format_stat(selected['median_delta_m'])}, "
+        f"median_delta_m_norm={format_stat(selected['median_delta_m_norm'])}"
     )
 
 
@@ -872,7 +970,36 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
-    rows, skipped = compute_shift_rows(host_bundle, iapr_bundle, threshold=args.threshold)
+    print("[Baseline] Estimating host score scale")
+    host_scale_metadata = compute_bundle_scale_metadata(
+        flow,
+        host_bundle,
+        args.margin_scale,
+        args.scale_eta,
+        args.scale_sample_size,
+        args.seed,
+        chunk_size=args.batch_size,
+    )
+    print("[IAPR] Estimating IAPR score scale")
+    iapr_scale_metadata = compute_bundle_scale_metadata(
+        flow,
+        iapr_bundle,
+        args.margin_scale,
+        args.scale_eta,
+        args.scale_sample_size,
+        args.seed,
+        chunk_size=args.batch_size,
+    )
+
+    rows, skipped = compute_shift_rows(
+        host_bundle,
+        iapr_bundle,
+        threshold=args.threshold,
+        margin_scale=args.margin_scale,
+        host_scale=float(host_scale_metadata["scale_value"]),
+        iapr_scale=float(iapr_scale_metadata["scale_value"]),
+        scale_eta=args.scale_eta,
+    )
     selected_rows = [row for row in rows if bool(row["selected_by_threshold"])]
     full_stats = stats_for_rows(rows)
     selected_stats = stats_for_rows(selected_rows)
@@ -886,8 +1013,14 @@ def main() -> None:
         "num_queries_usable": int(len(rows)),
         "num_queries_skipped": int(skipped),
         "num_queries_selected": int(len(selected_rows)),
+        "margin_scale": args.margin_scale,
+        "scale_eta": float(args.scale_eta),
+        "scale_sample_size": int(args.scale_sample_size),
+        "host_scale_metadata": host_scale_metadata,
+        "iapr_scale_metadata": iapr_scale_metadata,
         "threshold": float(args.threshold),
-        "selection_rule": "m_host < threshold",
+        "threshold_type": "raw" if args.margin_scale == "none" else "normalized",
+        "selection_rule": "m_host < threshold" if args.margin_scale == "none" else "m_host_norm < threshold",
         "pair_selection": "host_fixed",
         "full": full_stats,
         "selected": selected_stats,
