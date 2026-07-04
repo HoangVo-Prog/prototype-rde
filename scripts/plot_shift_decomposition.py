@@ -184,6 +184,10 @@ def metadata_from_standard_eval(meta: Mapping[str, Any]) -> Dict[str, Any]:
         result.update(dict(meta["retrieval_metrics"]))
     if meta.get("best_retrieval_metrics"):
         result["best_retrieval_metrics"] = dict(meta["best_retrieval_metrics"])
+    if meta.get("best_combo"):
+        result["best_combo"] = meta["best_combo"]
+    if meta.get("best_combo_metrics"):
+        result["best_combo_metrics"] = dict(meta["best_combo_metrics"])
     if meta.get("selected_retrieval_metrics"):
         result["selected_retrieval_metrics"] = dict(meta["selected_retrieval_metrics"])
     return result
@@ -334,7 +338,50 @@ def extract_feature_bundle(
     batch_size: int,
     num_workers: int,
     device: torch.device,
+    label: str = "Checkpoint",
 ) -> FeatureBundle:
+    if hasattr(flow, "extract_rde_similarity_components"):
+        sims, query_pids, gallery_pids, features = flow.extract_rde_similarity_components(
+            model,
+            split_data,
+            model_args,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            device=device,
+        )
+        best_combo_metrics = getattr(model_args, "best_combo_metrics", None)
+        if best_combo_metrics and isinstance(best_combo_metrics, Mapping) and best_combo_metrics.get("task"):
+            combo_metrics = dict(best_combo_metrics)
+            combo_metrics["task"] = flow.normalize_rde_task(combo_metrics["task"])
+        else:
+            print(
+                f"[{label}] Warning: no prior RDE ablation best combo was provided; "
+                "selecting the best combo from extracted official RDE similarities."
+            )
+            combo_metrics = flow.select_best_rde_combo_from_sims(sims, query_pids, gallery_pids)
+        task = flow.normalize_rde_task(combo_metrics["task"])
+        global_weight = float(flow.rde_combo_global_weight(task))
+        if hasattr(flow, "print_best_rde_combo"):
+            flow.print_best_rde_combo(label, combo_metrics)
+        return FeatureBundle(
+            text_features=features["bge_text"].cpu(),
+            image_features=features["bge_image"].cpu(),
+            query_pids=query_pids.cpu().long(),
+            gallery_pids=gallery_pids.cpu().long(),
+            inference={
+                "model_type": "rde",
+                "inference_mode": "rde_best_ablation_combo",
+                "ablation_task": task,
+                "best_combo": task,
+                "best_combo_metrics": combo_metrics,
+                "global_weight": global_weight,
+                "tse_weight": 1.0 - global_weight,
+                "similarity_source": "best_ablation_combo",
+            },
+            text_grab_features=features["tse_text"].cpu(),
+            image_grab_features=features["tse_image"].cpu(),
+        )
+
     text_features, query_pids = flow.extract_text_features(
         model,
         split_data,
@@ -442,6 +489,7 @@ def load_bundle_for_checkpoint(
             batch_size=batch_size,
             num_workers=num_workers,
             device=device,
+            label=label,
         )
         return bundle, {"checkpoint": str(checkpoint), "load_stats": load_stats, "inference": bundle.inference}
     finally:
@@ -781,6 +829,8 @@ def main() -> None:
             batch_size=args.batch_size,
             num_workers=args.num_workers,
         )
+        if baseline_eval_meta.get("best_combo_metrics") is not None:
+            setattr(baseline_model_args, "best_combo_metrics", baseline_eval_meta["best_combo_metrics"])
         if baseline_eval_meta.get("selected_inference") is not None:
             setattr(baseline_model_args, "selected_inference", baseline_eval_meta["selected_inference"])
 
@@ -794,6 +844,8 @@ def main() -> None:
             batch_size=args.batch_size,
             num_workers=args.num_workers,
         )
+        if iapr_eval_meta.get("best_combo_metrics") is not None:
+            setattr(iapr_model_args, "best_combo_metrics", iapr_eval_meta["best_combo_metrics"])
         if iapr_eval_meta.get("selected_inference") is not None:
             setattr(iapr_model_args, "selected_inference", iapr_eval_meta["selected_inference"])
 
@@ -843,6 +895,12 @@ def main() -> None:
         "iapr_load_stats": iapr_meta.get("load_stats", {}),
         "baseline_inference": baseline_meta.get("inference", {}),
         "iapr_inference": iapr_meta.get("inference", {}),
+        "baseline_best_combo": baseline_meta.get("inference", {}).get("best_combo"),
+        "baseline_best_combo_metrics": baseline_meta.get("inference", {}).get("best_combo_metrics", {}),
+        "iapr_best_combo": iapr_meta.get("inference", {}).get("best_combo"),
+        "iapr_best_combo_metrics": iapr_meta.get("inference", {}).get("best_combo_metrics", {}),
+        "host_pair_selection_similarity_source": "baseline_best_ablation_combo",
+        "iapr_similarity_source": "iapr_best_ablation_combo",
     }
     if baseline_eval_meta:
         stats["baseline_retrieval"] = metadata_from_standard_eval(baseline_eval_meta)

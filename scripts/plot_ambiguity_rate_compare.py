@@ -125,6 +125,14 @@ def evaluator_class() -> type:
         raise runtime_dependency_error("loading the standard retrieval evaluator", exc)
     return Evaluator
 
+
+def rde_get_metrics_function() -> Any:
+    try:
+        from utils.metrics import get_metrics
+    except ModuleNotFoundError as exc:
+        raise runtime_dependency_error("loading the RDE retrieval metric helper", exc)
+    return get_metrics
+
 GENERIC_DATASET_CONFIGS = {
     "CUHK-PEDES": {
         "dataset_dir": "CUHK-PEDES",
@@ -163,6 +171,7 @@ DEFAULT_IMAGE_DIRS = ["imgs", "images", "image", ""]
 DEFAULT_PATH_KEYS = ["img_path", "file_path", "image_path", "path", "filename", "image"]
 DEFAULT_PID_KEYS = ["id", "pid", "person_id", "identity", "identity_id", "label"]
 DEFAULT_CAPTION_KEYS = ["captions", "caption", "text", "description"]
+RDE_ABLATION_TASKS = ("BGE-t2i", "TSE-t2i", "BGE+TSE-t2i")
 
 LATEX_SNIPPET = r"""\begin{figure}[t]
 \centering
@@ -744,14 +753,20 @@ def call_model_encoder(encoder: Any, tensor: torch.Tensor, kind: str) -> torch.T
 
 
 @torch.inference_mode()
-def extract_text_features(
+def extract_text_features_from_encoder(
     model: torch.nn.Module,
     split_data: SplitData,
     text_length: int,
     batch_size: int,
     num_workers: int,
     device: torch.device,
+    encoder_name: str,
+    desc: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    encoder = getattr(model, encoder_name, None)
+    if encoder is None:
+        raise RuntimeError(f"Model does not provide {encoder_name}; cannot run the official RDE ablation path.")
+
     TextDataset = text_dataset_class()
     text_set = TextDataset(split_data.caption_pids, split_data.captions, text_length=text_length)
     loader = DataLoader(
@@ -765,14 +780,14 @@ def extract_text_features(
     pids: List[torch.Tensor] = []
 
     model.eval()
-    for pid, tokens in tqdm(loader, desc="Extracting text features"):
+    for pid, tokens in tqdm(loader, desc=desc):
         tokens = tokens.to(device, non_blocking=True)
-        feats = call_model_encoder(model.encode_text, tokens, "text").float()
+        feats = call_model_encoder(encoder, tokens, encoder_name).float()
         features.append(feats.cpu())
         pids.append(pid.view(-1).cpu().long())
 
     if not features:
-        raise RuntimeError("No text features were extracted.")
+        raise RuntimeError(f"No text features were extracted from {encoder_name}.")
 
     text_features = F.normalize(torch.cat(features, dim=0), p=2, dim=1)
     text_pids = torch.cat(pids, dim=0).long()
@@ -780,14 +795,20 @@ def extract_text_features(
 
 
 @torch.inference_mode()
-def extract_image_features(
+def extract_image_features_from_encoder(
     model: torch.nn.Module,
     split_data: SplitData,
     img_size: Tuple[int, int],
     batch_size: int,
     num_workers: int,
     device: torch.device,
+    encoder_name: str,
+    desc: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    encoder = getattr(model, encoder_name, None)
+    if encoder is None:
+        raise RuntimeError(f"Model does not provide {encoder_name}; cannot run the official RDE ablation path.")
+
     ImageDataset = image_dataset_class()
     transform = build_eval_transforms(img_size)
     image_set = ImageDataset(split_data.image_pids, split_data.img_paths, transform=transform)
@@ -802,18 +823,232 @@ def extract_image_features(
     pids: List[torch.Tensor] = []
 
     model.eval()
-    for pid, images in tqdm(loader, desc="Extracting image features"):
+    for pid, images in tqdm(loader, desc=desc):
         images = images.to(device, non_blocking=True)
-        feats = call_model_encoder(model.encode_image, images, "image").float()
+        feats = call_model_encoder(encoder, images, encoder_name).float()
         features.append(feats.cpu())
         pids.append(pid.view(-1).cpu().long())
 
     if not features:
-        raise RuntimeError("No image features were extracted.")
+        raise RuntimeError(f"No image features were extracted from {encoder_name}.")
 
     image_features = F.normalize(torch.cat(features, dim=0), p=2, dim=1)
     image_pids = torch.cat(pids, dim=0).long()
     return image_features, image_pids
+
+
+def extract_text_features(
+    model: torch.nn.Module,
+    split_data: SplitData,
+    text_length: int,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return extract_text_features_from_encoder(
+        model,
+        split_data,
+        text_length=text_length,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_text",
+        desc="Extracting BGE text features",
+    )
+
+
+def extract_image_features(
+    model: torch.nn.Module,
+    split_data: SplitData,
+    img_size: Tuple[int, int],
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return extract_image_features_from_encoder(
+        model,
+        split_data,
+        img_size=img_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_image",
+        desc="Extracting BGE image features",
+    )
+
+
+def ensure_same_pids(left: torch.Tensor, right: torch.Tensor, label: str) -> None:
+    if left.shape != right.shape or not torch.equal(left.cpu(), right.cpu()):
+        raise RuntimeError(f"{label} identity order changed between BGE and TSE feature extraction.")
+
+
+def normalize_rde_task(task: Any) -> str:
+    task_name = str(task).strip()
+    if not task_name:
+        raise RuntimeError("RDE best ablation metrics are missing the selected task.")
+    if not task_name.endswith("-t2i"):
+        task_name = f"{task_name}-t2i"
+    if task_name not in RDE_ABLATION_TASKS:
+        valid = ", ".join(RDE_ABLATION_TASKS)
+        raise RuntimeError(f"Unsupported RDE ablation task {task_name!r}. Expected one of: {valid}.")
+    return task_name
+
+
+def rde_combo_global_weight(task: Any) -> float:
+    task_name = normalize_rde_task(task)
+    if task_name == "BGE-t2i":
+        return 1.0
+    if task_name == "TSE-t2i":
+        return 0.0
+    if task_name == "BGE+TSE-t2i":
+        return 0.5
+    raise RuntimeError(f"Unsupported RDE ablation task {task_name!r}.")
+
+
+def rde_metrics_from_similarity(
+    task: str,
+    sim: torch.Tensor,
+    query_pids: torch.Tensor,
+    gallery_pids: torch.Tensor,
+) -> Dict[str, Any]:
+    get_metrics = rde_get_metrics_function()
+    row = get_metrics(sim, query_pids, gallery_pids, task, False)
+    return {
+        "task": str(row[0]),
+        "R1": float(row[1]),
+        "R5": float(row[2]),
+        "R10": float(row[3]),
+        "mAP": float(row[4]),
+        "mINP": float(row[5]),
+        "rSum": float(row[6]),
+    }
+
+
+def select_best_rde_combo_from_sims(
+    sims: Mapping[str, torch.Tensor],
+    query_pids: torch.Tensor,
+    gallery_pids: torch.Tensor,
+) -> Dict[str, Any]:
+    best_metrics: Dict[str, Any] = {}
+    best_r1 = float("-inf")
+    for task in RDE_ABLATION_TASKS:
+        metrics = rde_metrics_from_similarity(task, sims[task], query_pids, gallery_pids)
+        # Match utils.metrics.Evaluator.eval: ties on R@1 are resolved by the later row.
+        if float(metrics["R1"]) >= best_r1:
+            best_metrics = metrics
+            best_r1 = float(metrics["R1"])
+    if not best_metrics:
+        raise RuntimeError("Could not select an RDE best ablation combo.")
+    return best_metrics
+
+
+def print_best_rde_combo(label: str, best_metrics: Mapping[str, Any]) -> None:
+    if not best_metrics:
+        print(f"[{label}] Warning: no RDE best ablation combo is available.")
+        return
+    task = normalize_rde_task(best_metrics.get("task"))
+    print(f"[{label}] Best ablation combo: {task}")
+    print(
+        f"[{label}] Best ablation metrics: "
+        f"R@1={float(best_metrics.get('R1', 0.0)):.2f}, "
+        f"R@5={float(best_metrics.get('R5', 0.0)):.2f}, "
+        f"R@10={float(best_metrics.get('R10', 0.0)):.2f}, "
+        f"mAP={float(best_metrics.get('mAP', 0.0)):.2f}"
+    )
+
+
+def extract_rde_similarity_components(
+    model: torch.nn.Module,
+    split_data: SplitData,
+    model_args: SimpleNamespace,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    bge_text, query_pids = extract_text_features(
+        model,
+        split_data,
+        text_length=int(model_args.text_length),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+    )
+    bge_image, gallery_pids = extract_image_features(
+        model,
+        split_data,
+        img_size=parse_img_size(model_args.img_size),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+    )
+    tse_text, tse_query_pids = extract_text_features_from_encoder(
+        model,
+        split_data,
+        text_length=int(model_args.text_length),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_text_tse",
+        desc="Extracting TSE text features",
+    )
+    tse_image, tse_gallery_pids = extract_image_features_from_encoder(
+        model,
+        split_data,
+        img_size=parse_img_size(model_args.img_size),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_image_tse",
+        desc="Extracting TSE image features",
+    )
+    ensure_same_pids(query_pids, tse_query_pids, "Query")
+    ensure_same_pids(gallery_pids, tse_gallery_pids, "Gallery")
+
+    sims = {
+        "BGE-t2i": bge_text @ bge_image.t(),
+        "TSE-t2i": tse_text @ tse_image.t(),
+    }
+    sims["BGE+TSE-t2i"] = (sims["BGE-t2i"] + sims["TSE-t2i"]) / 2.0
+    features = {
+        "bge_text": bge_text,
+        "bge_image": bge_image,
+        "tse_text": tse_text,
+        "tse_image": tse_image,
+    }
+    return sims, query_pids, gallery_pids, features
+
+
+def compute_best_combo_similarity_for_model(
+    model: torch.nn.Module,
+    split_data: SplitData,
+    model_args: SimpleNamespace,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    best_combo_metrics: Optional[Mapping[str, Any]] = None,
+    label: str = "Checkpoint",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any], Dict[str, torch.Tensor]]:
+    sims, query_pids, gallery_pids, features = extract_rde_similarity_components(
+        model,
+        split_data,
+        model_args,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+    )
+    if best_combo_metrics and best_combo_metrics.get("task"):
+        combo_metrics = dict(best_combo_metrics)
+        task = normalize_rde_task(combo_metrics["task"])
+        combo_metrics["task"] = task
+    else:
+        print(
+            f"[{label}] Warning: no prior RDE ablation best combo was provided; "
+            "selecting the best combo from extracted official RDE similarities."
+        )
+        combo_metrics = select_best_rde_combo_from_sims(sims, query_pids, gallery_pids)
+        task = normalize_rde_task(combo_metrics["task"])
+    print_best_rde_combo(label, combo_metrics)
+    return sims[task], query_pids, gallery_pids, combo_metrics, features
 
 
 def compute_margin_rows(
@@ -906,13 +1141,14 @@ def compute_margins_for_checkpoint(
     device: torch.device,
     batch_size: int,
     num_workers: int,
+    best_combo_metrics: Optional[Mapping[str, Any]] = None,
+    label: str = "Checkpoint",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     model: Optional[torch.nn.Module] = None
-    text_features: Optional[torch.Tensor] = None
-    image_features: Optional[torch.Tensor] = None
     query_pids: Optional[torch.Tensor] = None
     gallery_pids: Optional[torch.Tensor] = None
     sim: Optional[torch.Tensor] = None
+    selected_combo_metrics: Dict[str, Any] = {}
 
     try:
         model, run_args, load_stats, checkpoint = load_model_for_checkpoint(
@@ -921,36 +1157,29 @@ def compute_margins_for_checkpoint(
             split_data,
             device,
         )
-        text_features, query_pids = extract_text_features(
+        sim, query_pids, gallery_pids, selected_combo_metrics, _features = compute_best_combo_similarity_for_model(
             model,
             split_data,
-            text_length=int(run_args.text_length),
+            run_args,
             batch_size=batch_size,
             num_workers=num_workers,
             device=device,
+            best_combo_metrics=best_combo_metrics,
+            label=label,
         )
-        image_features, gallery_pids = extract_image_features(
-            model,
-            split_data,
-            img_size=parse_img_size(run_args.img_size),
-            batch_size=batch_size,
-            num_workers=num_workers,
-            device=device,
-        )
-
-        sim = text_features @ image_features.t()
         rows, skipped = compute_margin_rows(sim, query_pids, gallery_pids)
         margin_summary = summarize_margins(rows, total_queries=len(query_pids), skipped=skipped)
         metadata: Dict[str, Any] = {
             "checkpoint": str(checkpoint),
             "load_stats": load_stats,
             "margin_summary": margin_summary,
+            "best_combo": selected_combo_metrics.get("task"),
+            "best_combo_metrics": selected_combo_metrics,
+            "similarity_source": "best_ablation_combo",
         }
         return rows, metadata
     finally:
         model = None
-        text_features = None
-        image_features = None
         query_pids = None
         gallery_pids = None
         sim = None
@@ -1100,11 +1329,19 @@ def evaluate_checkpoint_on_test_split(
         evaluator = build_standard_evaluator(image_loader, text_loader, run_args)
         metrics, best_metrics = run_standard_retrieval_eval(evaluator, model)
         print_retrieval_metrics(label, metrics, best_metrics)
+        if best_metrics:
+            best_metrics = dict(best_metrics)
+            best_metrics["task"] = normalize_rde_task(best_metrics.get("task"))
+            print_best_rde_combo(label, best_metrics)
+        else:
+            print(f"[{label}] Warning: standard RDE evaluation returned no best ablation combo.")
         return {
             "checkpoint": str(checkpoint),
             "load_stats": load_stats,
             "retrieval_metrics": metrics,
             "best_retrieval_metrics": dict(best_metrics),
+            "best_combo": best_metrics.get("task") if best_metrics else None,
+            "best_combo_metrics": dict(best_metrics),
         }
     finally:
         model = None
@@ -1490,6 +1727,8 @@ def main() -> None:
         device,
         args.batch_size,
         args.num_workers,
+        best_combo_metrics=baseline_eval_meta.get("best_combo_metrics") if isinstance(baseline_eval_meta, Mapping) else None,
+        label="Baseline",
     )
     print_load_stats("Baseline", baseline_meta)
 
@@ -1501,6 +1740,8 @@ def main() -> None:
         device,
         args.batch_size,
         args.num_workers,
+        best_combo_metrics=ours_eval_meta.get("best_combo_metrics") if isinstance(ours_eval_meta, Mapping) else None,
+        label="Ours",
     )
     print_load_stats("Ours", ours_meta)
 
@@ -1527,6 +1768,15 @@ def main() -> None:
         "paired_delta_summary": delta_summary,
         "baseline_load_stats": baseline_meta.get("load_stats", {}),
         "ours_load_stats": ours_meta.get("load_stats", {}),
+        "baseline_best_combo": baseline_meta.get("best_combo"),
+        "baseline_best_combo_metrics": baseline_meta.get("best_combo_metrics", {}),
+        "ours_best_combo": ours_meta.get("best_combo"),
+        "ours_best_combo_metrics": ours_meta.get("best_combo_metrics", {}),
+        "iapr_best_combo": ours_meta.get("best_combo"),
+        "iapr_best_combo_metrics": ours_meta.get("best_combo_metrics", {}),
+        "baseline_similarity_source": "baseline_best_ablation_combo",
+        "ours_similarity_source": "ours_best_ablation_combo",
+        "iapr_similarity_source": "iapr_best_ablation_combo",
         "test_retrieval_verification": {
             "baseline": baseline_eval_meta,
             "ours": ours_eval_meta,
